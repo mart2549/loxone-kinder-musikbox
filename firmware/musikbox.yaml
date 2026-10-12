@@ -1,0 +1,759 @@
+# =====================================================================
+# Loxone Kinder-Musikbox  (NFC-Station fuer den Loxone Audioserver)
+# Seeed XIAO ESP32C3 + PN532 (I2C) + WS2812B-Stick (10 LEDs) + 4 Taster
+#
+# Verhalten
+#   Karte auflegen   -> Kartennummer (NDEF-Text, z. B. "12") per UDP an Loxone,
+#                       LED leuchtet in der Farbe "Karte erkannt", solange die Karte liegt
+#   Karte wegnehmen  -> "karte=0" an Loxone (Musik stoppt), LED aus
+#   Karte ohne Nummer -> Blinksignal "Karte ohne Nummer", nichts wird gesendet
+#   Kein WLAN > 3 s   -> Blinksignal "Kein Netzwerk", sobald eine Karte liegt, eine Karte
+#                       aufgelegt oder eine Taste gedrueckt wird (ohne Karte kein Blinken,
+#                       damit es nachts dunkel bleibt)
+#   Farbe, Helligkeit, Anzahl und Tempo aller Signale sind auf der Statusseite einstellbar
+#   und bleiben nach einem Neustart erhalten.
+#   Tasten           -> nur aktiv, solange eine gueltige Karte liegt
+#                       leiser/lauter: Impuls je Druck, gehalten alle 0,3 s weiter
+#                       zurueck/weiter: ein Impuls je Druck
+#
+# Einstellungen je Box auf der Statusseite (ab Version 1.2, eine Firmware fuer alle Boxen):
+#   Name der Box, Loxone-IP und UDP-Port. Voreinstellung 192.168.178.10 / 7000.
+#   Der Netzwerkname bekommt automatisch die letzten 6 Stellen der MAC-Adresse angehaengt.
+#
+# UDP-Telegramme an den Miniserver (virtueller UDP-Eingang, Voreinstellung Port 7000):
+#   karte=<nummer>   karte=0 beim Wegnehmen
+#   taste=1 leiser, taste=2 lauter, taste=3 zurueck, taste=4 weiter,
+#   danach jeweils taste=0 (damit Loxone jeden Druck als Impuls erkennt)
+#   karte=-1         nach Neustart bzw. WLAN-Verbindung ohne aufgelegte Karte:
+#                    Zustand zuruecksetzen, Musik NICHT stoppen
+#
+# Stromausfall / WLAN-Verbindung
+#   Kein staendiges Lebenszeichen. Nach jeder WLAN-Verbindung wird einmal der
+#   aktuelle Stand gesendet: taste=0, dann
+#     Karte liegt                        -> karte=<nummer> (Titel laeuft weiter)
+#     Karte wurde offline weggenommen     -> karte=0 (Stopp wird nachgeholt)
+#     sonst                               -> karte=-1
+#   Telegramme ohne WLAN werden nicht zwischengespeichert (ausser dem Stopp).
+#
+# Pinbelegung XIAO ESP32C3
+#   D1 GPIO3  Taste leiser        D4 GPIO6  I2C SDA (PN532)
+#   D2 GPIO4  Taste lauter        D5 GPIO7  I2C SCL (PN532)
+#   D3 GPIO5  Taste zurueck       D10 GPIO10 LED-Daten (330 Ohm in Reihe)
+#   D7 GPIO20 Taste weiter        Taster jeweils gegen GND
+#
+# Ereignislog (ereignislog.h)
+#   Jede steigende und fallende Flanke von Karte und Tasten wird mit Datum und
+#   Uhrzeit dauerhaft im Flash gespeichert (eigener Bereich "ereignislog",
+#   256 KB). Belegt werden hoechstens 70 % davon, bevor die Grenze
+#   ueberschritten wuerde, werden die aeltesten Eintraege geloescht.
+#   Ausgabe ueber den Knopf "Ereignislog ausgeben" auf der Statusseite.
+# =====================================================================
+
+substitutions:
+  name: musikbox
+  friendly_name: Kinder-Musikbox
+  loxone_ip: 192.168.178.10      # nur Voreinstellung, auf der Statusseite aenderbar
+  loxone_udp_port: "7000"
+  wiederhol_ms: 300ms      # Wiederholrate beim Halten von leiser/lauter
+  wiederhol_start: 500ms   # Verzoegerung bis zur ersten Wiederholung
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  # Netzwerkname eindeutig je Box, z. B. musikbox-a1b2c3
+  name_add_mac_suffix: true
+  includes:
+    - ereignislog.h
+    - udp_lx.h
+  on_boot:
+    priority: 800
+    then:
+      - lambda: "elog::init();"
+
+esp32:
+  board: seeed_xiao_esp32c3
+  framework:
+    type: esp-idf
+  # Eigener Flash-Bereich fuer das Ereignislog (256 KB).
+  # Achtung: Die Aufteilung laesst sich nur per USB aendern, nicht per Update.
+  partitions:
+    - name: ereignislog
+      type: 0x40
+      subtype: 0x00
+      size: 0x40000
+
+# Log ueber den USB-Anschluss, damit GPIO20 (D7) als Tasteneingang frei ist
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  on_connect:
+    - lambda: "id(netz_ok) = true;"
+    - script.execute: nach_verbindung
+  on_disconnect:
+    - lambda: "id(netz_ok) = false;"
+  # Notfall-Zugangspunkt, falls das WLAN nicht erreichbar ist
+  ap:
+    ssid: "Musikbox Setup"
+    password: !secret ap_password
+
+captive_portal:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+  # Firmware-Update direkt im Browser ueber die Statusseite (ohne ESPHome)
+  - platform: web_server
+
+# Statusseite im Browser (http://<ip-der-box>), zeigt LED, Tasten und WLAN-Signal,
+# ausserdem Firmware-Update per Datei-Upload
+web_server:
+  port: 80
+  auth:
+    username: admin
+    password: !secret web_password
+
+# Uhrzeit fuer die Zeitstempel im Ereignislog (von der FritzBox bzw. aus dem Netz)
+time:
+  - platform: sntp
+    id: uhr
+    timezone: Europe/Berlin
+    servers:
+      - fritz.box
+      - 0.de.pool.ntp.org
+      - 1.de.pool.ntp.org
+
+# Ereignislog paketweise ausgeben, damit die Box dabei nicht blockiert
+interval:
+  - interval: 50ms
+    then:
+      - lambda: "elog::ausgabe_schritt(20);"
+  # WLAN-Ueberwachung: nach mehr als 3 s ohne Verbindung Netzwerkfehler melden
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (id(netz_ok)) {
+            id(netz_weg_seit) = 0;
+            id(netz_fehler) = false;
+            return;
+          }
+          uint32_t jetzt = millis();
+          if (id(netz_weg_seit) == 0) id(netz_weg_seit) = jetzt ? jetzt : 1;
+          if (!id(netz_fehler) && jetzt - id(netz_weg_seit) > 3000) {
+            id(netz_fehler) = true;
+            ESP_LOGW("musikbox", "Kein WLAN seit mehr als 3 s");
+            if (id(karte_aktiv)) id(signal_netz)->execute();
+          }
+
+button:
+  - platform: template
+    name: "Ereignislog ausgeben"
+    icon: mdi:format-list-bulleted
+    on_press:
+      - lambda: "elog::ausgabe_starten();"
+  - platform: template
+    name: "Vorschau Karte erkannt"
+    icon: mdi:palette
+    entity_category: config
+    on_press:
+      - script.execute: led_karte_an
+      - delay: 3s
+      - if:
+          condition:
+            lambda: "return !id(karte_aktiv);"
+          then:
+            - light.turn_off: led
+  - platform: template
+    name: "Vorschau Karte ohne Nummer"
+    icon: mdi:palette
+    entity_category: config
+    on_press:
+      - script.execute: signal_karte_fehler
+  - platform: template
+    name: "Vorschau Kein Netzwerk"
+    icon: mdi:palette
+    entity_category: config
+    on_press:
+      - script.execute: signal_netz
+  - platform: template
+    name: "Verbindungstest Loxone"
+    icon: mdi:lan-connect
+    entity_category: config
+    on_press:
+      # taste=0 ist harmlos; im Loxone-Monitor muss es am eingestellten Port ankommen
+      - script.execute: {id: sende, msg: "taste=0"}
+  - platform: template
+    name: "Ereignislog loeschen"
+    icon: mdi:delete
+    entity_category: config
+    on_press:
+      - lambda: "elog::formatieren();"
+
+globals:
+  - id: netz_ok          # WLAN verbunden
+    type: bool
+    initial_value: "false"
+  - id: stopp_offen      # Karte wurde ohne WLAN weggenommen, Stopp nachholen
+    type: bool
+    initial_value: "false"
+  - id: karte_aktiv
+    type: bool
+    initial_value: "false"
+  - id: karte_nr
+    type: int
+    initial_value: "0"
+  - id: netz_weg_seit    # millis() seit dem WLAN-Verlust, 0 = verbunden
+    type: uint32_t
+    initial_value: "0"
+  - id: netz_fehler      # WLAN seit mehr als 3 s weg
+    type: bool
+    initial_value: "false"
+
+script:
+  - id: sende
+    mode: queued
+    parameters:
+      msg: string
+    then:
+      - if:
+          condition:
+            lambda: "return id(netz_ok);"
+          then:
+            - script.execute: {id: udp_senden, msg: !lambda "return msg;"}
+          else:
+            - lambda: |-
+                ESP_LOGW("musikbox", "Kein WLAN, nicht gesendet: %s", msg.c_str());
+                if (msg == "karte=0") id(stopp_offen) = true;
+
+  - id: udp_senden
+    mode: queued
+    parameters:
+      msg: string
+    then:
+      - lambda: |-
+          ESP_LOGD("musikbox", "UDP an Loxone: %s (%s:%d)", msg.c_str(),
+                   id(lx_ip).state.c_str(), (int) id(lx_port).state);
+          udp_lx::senden(id(lx_ip).state, (int) id(lx_port).state, msg);
+
+  # Nach jeder WLAN-Verbindung einmal den aktuellen Stand melden
+  - id: nach_verbindung
+    mode: restart
+    then:
+      - delay: 500ms
+      - script.execute: {id: sende, msg: "taste=0"}
+      - delay: 50ms
+      - lambda: |-
+          if (id(karte_aktiv)) {
+            id(stopp_offen) = false;
+            id(sende)->execute("karte=" + to_string(id(karte_nr)));
+          } else if (id(stopp_offen)) {
+            id(stopp_offen) = false;
+            id(sende)->execute(std::string("karte=0"));
+          } else {
+            id(sende)->execute(std::string("karte=-1"));
+          }
+
+  - id: taste_impuls
+    mode: queued
+    parameters:
+      nr: int
+    then:
+      - script.execute:
+          id: sende
+          msg: !lambda 'return "taste=" + to_string(nr);'
+      - delay: 80ms
+      - script.execute:
+          id: sende
+          msg: "taste=0"
+
+  # ---------------- LED-Signale ----------------
+  # Karte erkannt: ruhig in der eingestellten Farbe
+  - id: led_karte_an
+    mode: restart
+    then:
+      - lambda: |-
+          float v = id(k_v).state / 100.0f;
+          if (v <= 0.0f) { auto c = id(led).turn_off(); c.perform(); return; }
+          float r, g, b;
+          hsv_to_rgb((int) id(k_h).state % 360, id(k_s).state / 100.0f, 1.0f, r, g, b);
+          auto c = id(led).turn_on();
+          c.set_rgb(r, g, b);
+          c.set_brightness(v);
+          c.set_transition_length(200);
+          c.perform();
+
+  # Blinksignal: Farbton h, Saettigung s und Helligkeit v in %, n x blinken, t ms an / t ms aus.
+  # Danach wieder die Farbe "Karte erkannt", falls eine gueltige Karte liegt.
+  - id: led_signal
+    mode: restart
+    parameters:
+      h: int
+      s: float
+      v: float
+      n: int
+      t: int
+    then:
+      - repeat:
+          count: !lambda "return n;"
+          then:
+            - lambda: |-
+                float r, g, b;
+                hsv_to_rgb(h % 360, s / 100.0f, 1.0f, r, g, b);
+                auto c = id(led).turn_on();
+                c.set_rgb(r, g, b);
+                c.set_brightness(v / 100.0f);
+                c.set_transition_length(0);
+                c.perform();
+            - delay: !lambda "return t;"
+            - light.turn_off:
+                id: led
+                transition_length: 0s
+            - delay: !lambda "return t;"
+      - lambda: "if (id(karte_aktiv)) id(led_karte_an)->execute();"
+
+  - id: signal_karte_fehler
+    then:
+      - lambda: |-
+          id(led_signal)->execute((int) id(fk_h).state, id(fk_s).state, id(fk_v).state,
+                                  (int) id(fk_n).state, (int) id(fk_t).state);
+
+  - id: signal_netz
+    then:
+      - lambda: |-
+          id(led_signal)->execute((int) id(fn_h).state, id(fn_s).state, id(fn_v).state,
+                                  (int) id(fn_n).state, (int) id(fn_t).state);
+
+  # Nach dem Verstellen eines Reglers die Farbe sofort uebernehmen, wenn eine Karte liegt
+  - id: led_aktualisieren
+    then:
+      - if:
+          condition:
+            lambda: "return id(karte_aktiv) && !id(led_signal).is_running();"
+          then:
+            - script.execute: led_karte_an
+
+  # Halten von leiser/lauter: nach kurzer Pause regelmaessig wiederholen
+  - id: halten_leiser
+    mode: restart
+    then:
+      - delay: ${wiederhol_start}
+      - while:
+          condition:
+            and:
+              - binary_sensor.is_on: taste_leiser
+              - lambda: "return id(karte_aktiv);"
+          then:
+            - script.execute: {id: taste_impuls, nr: 1}
+            - delay: ${wiederhol_ms}
+  - id: halten_lauter
+    mode: restart
+    then:
+      - delay: ${wiederhol_start}
+      - while:
+          condition:
+            and:
+              - binary_sensor.is_on: taste_lauter
+              - lambda: "return id(karte_aktiv);"
+          then:
+            - script.execute: {id: taste_impuls, nr: 2}
+            - delay: ${wiederhol_ms}
+
+i2c:
+  sda: GPIO6
+  scl: GPIO7
+  frequency: 100kHz
+
+pn532_i2c:
+  id: nfc_leser
+  update_interval: 400ms
+  on_tag:
+    then:
+      - lambda: |-
+          int nr = 0;
+          auto jetzt = id(uhr).now();
+          uint32_t zeit = jetzt.is_valid() ? jetzt.timestamp : 0;
+          if (tag.has_ndef_message()) {
+            for (auto &rec : tag.get_ndef_message()->get_records()) {
+              if (rec->get_type() == "T") {
+                nr = atoi(rec->get_payload().c_str());
+                break;
+              }
+            }
+          }
+          elog::schreibe(elog::KARTE, true, (nr > 0 && nr < 10000) ? nr : elog::KEINE_NUMMER, zeit);
+          if (nr > 0 && nr < 10000) {
+            id(stopp_offen) = false;
+            id(karte_aktiv) = true;
+            id(karte_nr) = nr;
+            ESP_LOGI("musikbox", "Karte %d aufgelegt (UID %s)", nr, x.c_str());
+            id(sende)->execute("karte=" + to_string(nr));
+            if (id(netz_fehler)) id(signal_netz)->execute();
+            else id(led_karte_an)->execute();
+          } else {
+            id(karte_aktiv) = false;
+            id(karte_nr) = 0;
+            ESP_LOGW("musikbox", "Karte ohne gueltige Nummer (UID %s)", x.c_str());
+            id(signal_karte_fehler)->execute();
+          }
+  on_tag_removed:
+    then:
+      - lambda: |-
+          auto jetzt = id(uhr).now();
+          elog::schreibe(elog::KARTE, false, id(karte_aktiv) ? id(karte_nr) : elog::KEINE_NUMMER,
+                         jetzt.is_valid() ? jetzt.timestamp : 0);
+          if (id(karte_aktiv)) {
+            ESP_LOGI("musikbox", "Karte %d entfernt", id(karte_nr));
+            id(sende)->execute(std::string("karte=0"));
+          }
+          id(karte_aktiv) = false;
+          id(karte_nr) = 0;
+      - script.stop: halten_leiser
+      - script.stop: halten_lauter
+      - script.stop: led_signal
+      - script.stop: led_karte_an
+      - light.turn_off:
+          id: led
+          transition_length: 300ms
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led
+    name: "LED"
+    pin: GPIO10
+    num_leds: 10
+    rgb_order: GRB
+    chipset: WS2812
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 200ms
+
+binary_sensor:
+  - platform: gpio
+    id: taste_leiser
+    name: "Taste leiser"
+    pin: {number: GPIO3, mode: {input: true, pullup: true}, inverted: true}
+    filters: [delayed_on: 20ms, delayed_off: 20ms]
+    on_release:
+      - lambda: |-
+          auto t = id(uhr).now();
+          elog::schreibe(elog::LEISER, false, id(karte_aktiv) ? 1 : 0, t.is_valid() ? t.timestamp : 0);
+    on_press:
+      - lambda: |-
+          auto t = id(uhr).now();
+          elog::schreibe(elog::LEISER, true, id(karte_aktiv) ? 1 : 0, t.is_valid() ? t.timestamp : 0);
+      - if:
+          condition:
+            lambda: "return id(karte_aktiv);"
+          then:
+            - script.execute: {id: taste_impuls, nr: 1}
+            - script.execute: halten_leiser
+      - if:
+          condition:
+            lambda: "return id(karte_aktiv) && id(netz_fehler);"
+          then:
+            - script.execute: signal_netz
+  - platform: gpio
+    id: taste_lauter
+    name: "Taste lauter"
+    pin: {number: GPIO4, mode: {input: true, pullup: true}, inverted: true}
+    filters: [delayed_on: 20ms, delayed_off: 20ms]
+    on_release:
+      - lambda: |-
+          auto t = id(uhr).now();
+          elog::schreibe(elog::LAUTER, false, id(karte_aktiv) ? 1 : 0, t.is_valid() ? t.timestamp : 0);
+    on_press:
+      - lambda: |-
+          auto t = id(uhr).now();
+          elog::schreibe(elog::LAUTER, true, id(karte_aktiv) ? 1 : 0, t.is_valid() ? t.timestamp : 0);
+      - if:
+          condition:
+            lambda: "return id(karte_aktiv);"
+          then:
+            - script.execute: {id: taste_impuls, nr: 2}
+            - script.execute: halten_lauter
+      - if:
+          condition:
+            lambda: "return id(karte_aktiv) && id(netz_fehler);"
+          then:
+            - script.execute: signal_netz
+  - platform: gpio
+    id: taste_zurueck
+    name: "Taste zurueck"
+    pin: {number: GPIO5, mode: {input: true, pullup: true}, inverted: true}
+    filters: [delayed_on: 20ms, delayed_off: 20ms]
+    on_release:
+      - lambda: |-
+          auto t = id(uhr).now();
+          elog::schreibe(elog::ZURUECK, false, id(karte_aktiv) ? 1 : 0, t.is_valid() ? t.timestamp : 0);
+    on_press:
+      - lambda: |-
+          auto t = id(uhr).now();
+          elog::schreibe(elog::ZURUECK, true, id(karte_aktiv) ? 1 : 0, t.is_valid() ? t.timestamp : 0);
+      - if:
+          condition:
+            lambda: "return id(karte_aktiv);"
+          then:
+            - script.execute: {id: taste_impuls, nr: 3}
+      - if:
+          condition:
+            lambda: "return id(karte_aktiv) && id(netz_fehler);"
+          then:
+            - script.execute: signal_netz
+  - platform: gpio
+    id: taste_weiter
+    name: "Taste weiter"
+    pin: {number: GPIO20, mode: {input: true, pullup: true}, inverted: true}
+    filters: [delayed_on: 20ms, delayed_off: 20ms]
+    on_release:
+      - lambda: |-
+          auto t = id(uhr).now();
+          elog::schreibe(elog::WEITER, false, id(karte_aktiv) ? 1 : 0, t.is_valid() ? t.timestamp : 0);
+    on_press:
+      - lambda: |-
+          auto t = id(uhr).now();
+          elog::schreibe(elog::WEITER, true, id(karte_aktiv) ? 1 : 0, t.is_valid() ? t.timestamp : 0);
+      - if:
+          condition:
+            lambda: "return id(karte_aktiv);"
+          then:
+            - script.execute: {id: taste_impuls, nr: 4}
+      - if:
+          condition:
+            lambda: "return id(karte_aktiv) && id(netz_fehler);"
+          then:
+            - script.execute: signal_netz
+
+sensor:
+  - platform: template
+    name: "Ereignislog Fuellstand"
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: "return elog::fuellstand();"
+  - platform: template
+    name: "Ereignislog Eintraege"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: "return (float) elog::eintraege();"
+  - platform: wifi_signal
+    id: wlan_signal
+    name: "WLAN Signal"
+    update_interval: 60s
+
+# LED-Signale, auf der Statusseite einstellbar (Farbton 0 rot, 120 gruen, 240 blau;
+# Saettigung 0 = weiss). Voreinstellung fuer die rote Lichtleiste: weiss bzw. rot.
+# Einstellungen je Box (gespeichert, bleiben bei Updates erhalten)
+text:
+  - platform: template
+    id: box_name
+    name: "Name der Box"
+    icon: mdi:tag-text
+    entity_category: config
+    mode: text
+    max_length: 32
+    optimistic: true
+    restore_value: true
+    initial_value: "Musikbox"
+  - platform: template
+    id: lx_ip
+    name: "Loxone IP"
+    icon: mdi:ip-network
+    entity_category: config
+    mode: text
+    min_length: 7
+    max_length: 15
+    optimistic: true
+    restore_value: true
+    initial_value: "${loxone_ip}"
+    on_value:
+      - lambda: |-
+          if (!udp_lx::ip_gueltig(x)) ESP_LOGW("musikbox", "Loxone-IP '%s' ist keine gueltige Adresse", x.c_str());
+          else ESP_LOGI("musikbox", "Loxone-IP: %s", x.c_str());
+
+number:
+  - platform: template
+    id: lx_port
+    name: "Loxone UDP-Port"
+    icon: mdi:numeric
+    entity_category: config
+    mode: box
+    min_value: 1
+    max_value: 65535
+    step: 1
+    initial_value: ${loxone_udp_port}
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: k_h
+    name: "Karte erkannt Farbton"
+    icon: mdi:palette
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 360
+    step: 5
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "°"
+    on_value:
+      - script.execute: led_aktualisieren
+  - platform: template
+    id: k_s
+    name: "Karte erkannt Saettigung"
+    icon: mdi:palette
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+    on_value:
+      - script.execute: led_aktualisieren
+  - platform: template
+    id: k_v
+    name: "Karte erkannt Helligkeit"
+    icon: mdi:brightness-6
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 60
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+    on_value:
+      - script.execute: led_aktualisieren
+  - platform: template
+    id: fk_h
+    name: "Karte ohne Nummer Farbton"
+    icon: mdi:palette
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 360
+    step: 5
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "°"
+  - platform: template
+    id: fk_s
+    name: "Karte ohne Nummer Saettigung"
+    icon: mdi:palette
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+  - platform: template
+    id: fk_v
+    name: "Karte ohne Nummer Helligkeit"
+    icon: mdi:brightness-6
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+  - platform: template
+    id: fk_n
+    name: "Karte ohne Nummer Anzahl"
+    icon: mdi:counter
+    entity_category: config
+    mode: slider
+    min_value: 1
+    max_value: 10
+    step: 1
+    initial_value: 3
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: fk_t
+    name: "Karte ohne Nummer Tempo"
+    icon: mdi:timer-outline
+    entity_category: config
+    mode: slider
+    min_value: 50
+    max_value: 1000
+    step: 50
+    initial_value: 200
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "ms"
+  - platform: template
+    id: fn_h
+    name: "Kein Netzwerk Farbton"
+    icon: mdi:palette
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 360
+    step: 5
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "°"
+  - platform: template
+    id: fn_s
+    name: "Kein Netzwerk Saettigung"
+    icon: mdi:palette
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+  - platform: template
+    id: fn_v
+    name: "Kein Netzwerk Helligkeit"
+    icon: mdi:brightness-6
+    entity_category: config
+    mode: slider
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+  - platform: template
+    id: fn_n
+    name: "Kein Netzwerk Anzahl"
+    icon: mdi:counter
+    entity_category: config
+    mode: slider
+    min_value: 1
+    max_value: 10
+    step: 1
+    initial_value: 6
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: fn_t
+    name: "Kein Netzwerk Tempo"
+    icon: mdi:timer-outline
+    entity_category: config
+    mode: slider
+    min_value: 50
+    max_value: 1000
+    step: 50
+    initial_value: 100
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "ms"
